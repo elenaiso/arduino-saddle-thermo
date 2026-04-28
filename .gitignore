@@ -1,0 +1,21 @@
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs / local runtime artifacts
+web/connection.log
+
+# Arduino / build artifacts
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.a
+*.d
+*.tmp
+

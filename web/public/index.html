@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Saddle Thermo — Heatmap</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="header">
+        <div>
+          <div class="title">Saddle Thermo</div>
+          <div class="sub" id="subline">Serial: —</div>
+        </div>
+        <div class="controls">
+          <a class="btn btn-secondary" href="/graph.html">График</a>
+          <a class="btn btn-secondary" href="/layout-editor.html">Расстановка</a>
+          <button class="btn btn-secondary" id="saveLayoutBtn" title="Сохранить текущее назначение датчиков">Сохранить</button>
+          <button class="btn btn-secondary" id="resetLayoutBtn" title="Сбросить назначение датчиков">Сброс</button>
+          <select class="select mono" id="uiRateSelect" title="UI refresh rate">
+            <option value="0">UI: realtime</option>
+            <option value="2">UI: 2 Hz</option>
+            <option value="5">UI: 5 Hz</option>
+            <option value="10" selected>UI: 10 Hz</option>
+            <option value="20">UI: 20 Hz</option>
+          </select>
+          <select class="select mono" id="heatmapRateSelect" title="Heatmap recompute rate">
+            <option value="1">Heatmap: 1 Hz</option>
+            <option value="2" selected>Heatmap: 2 Hz</option>
+            <option value="5">Heatmap: 5 Hz</option>
+            <option value="10">Heatmap: 10 Hz</option>
+          </select>
+          <select class="select mono" id="arduinoHzSelect" title="Arduino sample rate">
+            <option value="">Arduino Hz…</option>
+            <option value="1">Arduino: 1 Hz</option>
+            <option value="2">Arduino: 2 Hz</option>
+            <option value="5">Arduino: 5 Hz</option>
+            <option value="10">Arduino: 10 Hz</option>
+            <option value="15">Arduino: 15 Hz</option>
+            <option value="20">Arduino: 20 Hz</option>
+          </select>
+          <select class="select mono" id="portSelect" title="Serial port"></select>
+          <button class="btn btn-secondary" id="connectBtn">Подключить</button>
+          <button class="btn" data-cmd="w">Шаг (w)</button>
+          <button class="btn" data-cmd="t">Рысь (t)</button>
+          <button class="btn" data-cmd="g">Галоп (g)</button>
+          <button class="btn btn-secondary" data-cmd="r">Рескан (r)</button>
+        </div>
+      </header>
+
+      <main class="main">
+        <section class="card heatmap-card">
+          <div class="card-title">
+            Тепловая карта (контур + интерполяция)
+            <span class="pill" id="modePill">—</span>
+          </div>
+          <div class="sub" id="dimsLine" style="margin:-6px 0 10px 0">—</div>
+          <div class="canvas-row">
+            <canvas id="heatmap" width="1600" height="900"></canvas>
+            <div class="legend">
+              <div class="legend-bar" id="legendBar"></div>
+              <div class="legend-labels">
+                <div id="legendMin">—</div>
+                <div id="legendMax">—</div>
+              </div>
+              <div class="legend-controls">
+                <label class="check mono">
+                  <input type="checkbox" id="rangeAuto" checked />
+                  Auto
+                </label>
+                <label class="field mono">
+                  Min
+                  <input type="number" step="0.5" id="rangeMin" value="20" />
+                </label>
+                <label class="field mono">
+                  Max
+                  <input type="number" step="0.5" id="rangeMax" value="45" />
+                </label>
+              </div>
+              <div class="hint">
+                Цвет откалиброван по абсолютной температуре (фиксированный диапазон).
+                Диапазон задаётся в <span class="mono">layout.json → interpolation.display.absMinC/absMaxC</span>.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card sensors-card">
+          <div class="card-title">Сырые значения датчиков</div>
+          <div class="grid" id="sensorGrid"></div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <div>Подключение: Arduino Nano → USB → Serial → WebSocket → браузер.</div>
+        <div class="mono">Окно: <span id="stats">—</span></div>
+      </footer>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
+

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Saddle Thermo — Graph</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="header">
+        <div>
+          <div class="title">Saddle Thermo</div>
+          <div class="sub" id="subline">Serial: —</div>
+        </div>
+        <div class="controls">
+          <a class="btn btn-secondary" href="/">Теплокарта</a>
+          <select class="select mono" id="uiRateSelect" title="UI refresh rate">
+            <option value="0">UI: realtime</option>
+            <option value="2">UI: 2 Hz</option>
+            <option value="5">UI: 5 Hz</option>
+            <option value="10" selected>UI: 10 Hz</option>
+            <option value="20">UI: 20 Hz</option>
+          </select>
+          <select class="select mono" id="sensorSelect" title="Sensor"></select>
+          <select class="select mono" id="windowSelect" title="Window">
+            <option value="30">30s</option>
+            <option value="60" selected>60s</option>
+            <option value="120">120s</option>
+            <option value="300">300s</option>
+          </select>
+        </div>
+      </header>
+
+      <main class="main">
+        <section class="card heatmap-card">
+          <div class="card-title">
+            График нагрева (абсолютная температура)
+            <span class="pill" id="modePill">—</span>
+          </div>
+          <canvas id="chart" width="1600" height="520"></canvas>
+          <div class="sub mono" style="margin-top:10px" id="stats">—</div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/graph.js"></script>
+  </body>
+</html>
+

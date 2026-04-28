@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Saddle Thermo — Layout editor</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="header">
+        <div>
+          <div class="title">Saddle Thermo</div>
+          <div class="sub" id="subline">Serial: —</div>
+        </div>
+        <div class="controls">
+          <a class="btn btn-secondary" href="/">Теплокарта</a>
+          <a class="btn btn-secondary" href="/graph.html">График</a>
+          <button class="btn" id="saveBtn">Сохранить</button>
+          <button class="btn btn-secondary" id="resetBtn">Сброс</button>
+          <button class="btn btn-secondary" id="exportBtn">Экспорт JSON</button>
+          <label class="btn btn-secondary" style="display:inline-flex;gap:10px;align-items:center;">
+            Импорт
+            <input type="file" id="importFile" accept="application/json" style="display:none;" />
+          </label>
+        </div>
+      </header>
+
+      <main class="main">
+        <section class="card heatmap-card">
+          <div class="card-title">
+            Ручная расстановка датчиков (перетащите точки)
+            <span class="pill mono" id="hintPill">drag & drop</span>
+          </div>
+          <div class="sub">
+            Перетаскивайте датчик на слот слева/справа — он “прилипнет” к ближайшему фиксированному месту. Сохранение идёт в браузер (localStorage).
+          </div>
+          <div style="height:10px"></div>
+          <canvas id="editor" width="1600" height="900"></canvas>
+          <div class="sub mono" style="margin-top:10px" id="stats">—</div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/layout-editor.js"></script>
+  </body>
+</html>
+

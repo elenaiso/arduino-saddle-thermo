@@ -1,0 +1,78 @@
+{
+  "canvas": { "width": 400, "height": 800 },
+  "physical": {
+    "lengthCm": 45,
+    "widthTopCm": 25,
+    "widthMidCm": 12,
+    "widthBottomCm": 15,
+    "ref": {
+      "yTopPx": 40,
+      "yBottomPx": 760,
+      "spineX": 200
+    }
+  },
+  "left": {
+    "contour": [
+      [200, 40],
+      [140, 80],
+      [100, 150],
+      [110, 250],
+      [140, 350],
+      [130, 550],
+      [160, 720],
+      [200, 760],
+      [200, 40]
+    ],
+    "sensors": [
+      { "idx": 0, "label": "1", "xy": [185, 145] },
+      { "idx": 1, "label": "2", "xy": [190, 285] },
+      { "idx": 2, "label": "3", "xy": [195, 405] },
+      { "idx": 3, "label": "4", "xy": [190, 530] },
+      { "idx": 4, "label": "5", "xy": [190, 700] },
+      { "idx": 5, "label": "6", "xy": [180, 105] },
+      { "idx": 6, "label": "7", "xy": [155, 205] },
+      { "idx": 7, "label": "8", "xy": [160, 645] }
+    ]
+  },
+  "right": {
+    "contour": [
+      [200, 40],
+      [260, 80],
+      [300, 150],
+      [290, 250],
+      [260, 350],
+      [270, 550],
+      [240, 720],
+      [200, 760],
+      [200, 40]
+    ],
+    "sensors": [
+      { "idx": 8, "label": "1", "xy": [215, 145] },
+      { "idx": 9, "label": "2", "xy": [210, 285] },
+      { "idx": 10, "label": "3", "xy": [205, 405] },
+      { "idx": 11, "label": "4", "xy": [210, 530] },
+      { "idx": 12, "label": "5", "xy": [210, 700] },
+      { "idx": 13, "label": "6", "xy": [220, 105] },
+      { "idx": 14, "label": "7", "xy": [245, 205] },
+      { "idx": 15, "label": "8", "xy": [240, 645] }
+    ]
+  },
+  "spine": {
+    "x": 200,
+    "gapPx": 16
+  },
+  "interpolation": {
+    "method": "gaussian",
+    "radiusPx": 220,
+    "sigmaPx": 70,
+    "stepPx": 5,
+    "baselineC": 22.0,
+    "baselineWeight": 0.08,
+    "display": {
+      "mode": "absolute",
+      "absMinC": 20.0,
+      "absMaxC": 45.0
+    }
+  }
+}
+
