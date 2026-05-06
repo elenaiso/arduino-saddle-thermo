@@ -1,5 +1,6 @@
 import express from 'express';
 import http from 'http';
+import net from 'net';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocketServer } from 'ws';
@@ -12,6 +13,8 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 5177);
 const SERIAL_PATH = process.env.SERIAL_PATH || ''; // e.g. /dev/tty.usbserial-XXXX
 const SERIAL_BAUD = Number(process.env.SERIAL_BAUD || 115200);
+const DEVICE_TCP_HOST = String(process.env.DEVICE_TCP_HOST || '').trim();
+const DEVICE_TCP_PORT = Number(process.env.DEVICE_TCP_PORT || 3333);
 
 const app = express();
 app.use(express.json());
@@ -47,13 +50,18 @@ const wss = new WebSocketServer({ server });
 const state = {
   connected: false,
   serialPath: null,
-  baud: SERIAL_BAUD,
+  baud: null,
   lastHello: null,
   lastSample: null,
   lastLineAtMs: 0
 };
 
 let serial = null;
+let tcpSocket = null;
+let tcpReconnectTimer = null;
+/** @type {{ host: string, port: number } | null} */
+let tcpReconnectArgs = null;
+
 const portEvents = [];
 const LOG_PATH = path.join(__dirname, 'connection.log');
 
@@ -163,7 +171,123 @@ function handleLegacyJson(obj) {
   return sample;
 }
 
+function ingestDeviceLine(trimmed) {
+  if (!trimmed) return;
+  state.lastLineAtMs = Date.now();
+
+  let obj = null;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    if (!handleLegacyTextLine(trimmed)) {
+      wsBroadcast({ type: 'raw', line: trimmed });
+    }
+    return;
+  }
+
+  const legacySample = handleLegacyJson(obj);
+  if (legacySample) {
+    wsBroadcast(legacySample);
+    return;
+  }
+
+  if (obj?.type === 'hello') state.lastHello = obj;
+  if (obj?.type === 'sample') state.lastSample = obj;
+  wsBroadcast(obj);
+}
+
+function ingestDeviceBuffer(bufRef, chunk) {
+  bufRef.buf += chunk.toString('utf8');
+  while (true) {
+    const idx = bufRef.buf.indexOf('\n');
+    if (idx === -1) break;
+    const line = bufRef.buf.slice(0, idx);
+    bufRef.buf = bufRef.buf.slice(idx + 1);
+    ingestDeviceLine(String(line).trim());
+  }
+}
+
+function detachTcp(clearReconnect) {
+  if (tcpReconnectTimer) {
+    clearTimeout(tcpReconnectTimer);
+    tcpReconnectTimer = null;
+  }
+  if (clearReconnect) tcpReconnectArgs = null;
+  if (tcpSocket) {
+    try {
+      tcpSocket.removeAllListeners();
+      tcpSocket.destroy();
+    } catch {}
+    tcpSocket = null;
+  }
+}
+
+/**
+ * @param {string} host
+ * @param {number} port
+ * @param {{ reconnect?: boolean }} opts
+ */
+function attachTcp(host, port, opts = {}) {
+  const reconnect = opts.reconnect !== false;
+
+  if (tcpReconnectTimer) {
+    clearTimeout(tcpReconnectTimer);
+    tcpReconnectTimer = null;
+  }
+  if (tcpSocket) {
+    try {
+      tcpSocket.removeAllListeners();
+      tcpSocket.destroy();
+    } catch {}
+    tcpSocket = null;
+  }
+
+  if (serial) {
+    try { serial.close(); } catch {}
+    serial = null;
+  }
+
+  legacy = { foundCount: null, addrsByIdx: new Map(), seq: 0, idxMap: null };
+  tcpReconnectArgs = reconnect ? { host, port } : null;
+
+  const bufRef = { buf: '' };
+  const sock = net.connect({ host, port }, () => {
+    state.connected = true;
+    state.serialPath = `tcp://${host}:${port}`;
+    state.baud = null;
+    wsBroadcast({ type: 'serial', status: 'connected', path: state.serialPath, baud: null });
+    logPortEvent({ ts: new Date().toISOString(), kind: 'tcp_open', host, port });
+  });
+
+  sock.on('data', (chunk) => ingestDeviceBuffer(bufRef, chunk));
+
+  sock.on('error', (err) => {
+    wsBroadcast({ type: 'serial', status: 'error', error: String(err?.message || err) });
+    logPortEvent({ ts: new Date().toISOString(), kind: 'tcp_error', host, port, error: String(err?.message || err) });
+  });
+
+  sock.on('close', () => {
+    state.connected = false;
+    state.serialPath = null;
+    state.baud = null;
+    tcpSocket = null;
+    wsBroadcast({ type: 'serial', status: 'closed' });
+    logPortEvent({ ts: new Date().toISOString(), kind: 'tcp_close', host, port });
+    if (tcpReconnectArgs) {
+      tcpReconnectTimer = setTimeout(() => {
+        tcpReconnectTimer = null;
+        attachTcp(tcpReconnectArgs.host, tcpReconnectArgs.port, { reconnect: true });
+      }, 2000);
+    }
+  });
+
+  tcpSocket = sock;
+}
+
 function attachSerial(portPath) {
+  detachTcp(true);
+  tcpReconnectArgs = null;
+
   if (serial) {
     try { serial.close(); } catch {}
     serial = null;
@@ -171,55 +295,26 @@ function attachSerial(portPath) {
   legacy = { foundCount: null, addrsByIdx: new Map(), seq: 0, idxMap: null };
 
   const sp = new SerialPort({ path: portPath, baudRate: SERIAL_BAUD, autoOpen: true });
-  let buf = '';
+  const bufRef = { buf: '' };
 
   state.connected = true;
   state.serialPath = portPath;
+  state.baud = SERIAL_BAUD;
   wsBroadcast({ type: 'serial', status: 'connected', path: portPath, baud: SERIAL_BAUD });
   logPortEvent({ ts: new Date().toISOString(), kind: 'serial_open', path: portPath, baud: SERIAL_BAUD });
 
-  sp.on('data', (chunk) => {
-    buf += chunk.toString('utf8');
-    while (true) {
-      const idx = buf.indexOf('\n');
-      if (idx === -1) break;
-      const line = buf.slice(0, idx);
-      buf = buf.slice(idx + 1);
-
-      const trimmed = String(line).trim();
-      if (!trimmed) continue;
-      state.lastLineAtMs = Date.now();
-
-      let obj = null;
-      try {
-        obj = JSON.parse(trimmed);
-      } catch {
-        if (!handleLegacyTextLine(trimmed)) {
-          wsBroadcast({ type: 'raw', line: trimmed });
-        }
-        continue;
-      }
-
-      const legacySample = handleLegacyJson(obj);
-      if (legacySample) {
-        wsBroadcast(legacySample);
-        continue;
-      }
-
-      if (obj?.type === 'hello') state.lastHello = obj;
-      if (obj?.type === 'sample') state.lastSample = obj;
-      wsBroadcast(obj);
-    }
-  });
+  sp.on('data', (chunk) => ingestDeviceBuffer(bufRef, chunk));
 
   sp.on('error', (err) => {
     state.connected = false;
+    state.baud = null;
     wsBroadcast({ type: 'serial', status: 'error', error: String(err?.message || err) });
     logPortEvent({ ts: new Date().toISOString(), kind: 'serial_error', path: portPath, error: String(err?.message || err) });
   });
 
   sp.on('close', () => {
     state.connected = false;
+    state.baud = null;
     wsBroadcast({ type: 'serial', status: 'closed' });
     logPortEvent({ ts: new Date().toISOString(), kind: 'serial_close', path: portPath });
   });
@@ -228,14 +323,23 @@ function attachSerial(portPath) {
   return serial;
 }
 
-function tryWriteSerial(cmd) {
-  if (!serial) return false;
-  try {
-    serial.write(cmd);
-    return true;
-  } catch {
-    return false;
+function tryWriteDevice(cmd) {
+  if (serial) {
+    try {
+      serial.write(cmd);
+      return true;
+    } catch {
+      return false;
+    }
   }
+  if (tcpSocket && !tcpSocket.destroyed) {
+    try {
+      return tcpSocket.write(cmd);
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 app.post('/api/connect', async (req, res) => {
@@ -246,7 +350,7 @@ app.post('/api/connect', async (req, res) => {
   }
 
   try {
-    if (state.serialPath === portPath && state.connected) {
+    if (state.serialPath === portPath && state.connected && serial) {
       return res.json({ ok: true, path: portPath, baud: SERIAL_BAUD, alreadyConnected: true });
     }
     attachSerial(portPath);
@@ -256,8 +360,25 @@ app.post('/api/connect', async (req, res) => {
   }
 });
 
+app.post('/api/connect-tcp', (req, res) => {
+  const host = String(req?.body?.host || '').trim();
+  const port = Number(req?.body?.port || DEVICE_TCP_PORT || 3333);
+  if (!host) return res.status(400).json({ error: 'Missing "host"' });
+  try {
+    attachTcp(host, port, { reconnect: true });
+    res.json({ ok: true, path: `tcp://${host}:${port}` });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 wss.on('connection', (ws) => {
-  ws.send(JSON.stringify({ type: 'serial', status: state.connected ? 'connected' : 'disconnected', path: state.serialPath, baud: SERIAL_BAUD }));
+  ws.send(JSON.stringify({
+    type: 'serial',
+    status: state.connected ? 'connected' : 'disconnected',
+    path: state.serialPath,
+    baud: state.baud
+  }));
   if (state.lastHello) ws.send(JSON.stringify(state.lastHello));
   if (state.lastSample) ws.send(JSON.stringify(state.lastSample));
 
@@ -268,11 +389,11 @@ wss.on('connection', (ws) => {
     // - set hz: "hz=7"
     if (!msg) return;
     if (msg === 'w' || msg === 't' || msg === 'g' || msg === 'r') {
-      tryWriteSerial(msg);
+      tryWriteDevice(msg);
       return;
     }
     if (/^hz=\d{1,2}$/i.test(msg)) {
-      tryWriteSerial(`${msg}\n`);
+      tryWriteDevice(`${msg}\n`);
       return;
     }
   });
@@ -291,15 +412,20 @@ async function main() {
     } catch {}
   }, 1000);
 
-  if (!SERIAL_PATH) {
-    console.log('SERIAL_PATH not set. You can still open the UI and choose a port in the browser via /api/ports, then restart with SERIAL_PATH.');
+  if (SERIAL_PATH) {
+    attachSerial(normalizePortPath(SERIAL_PATH));
+  } else if (DEVICE_TCP_HOST) {
+    attachTcp(DEVICE_TCP_HOST, DEVICE_TCP_PORT, { reconnect: true });
   } else {
-    attachSerial(SERIAL_PATH);
+    console.log('No SERIAL_PATH or DEVICE_TCP_HOST. Use UI serial picker (/api/connect) or POST /api/connect-tcp, or set env vars.');
   }
 
-  server.listen(PORT, () => {
-    console.log(`Web UI: http://localhost:${PORT}`);
-    console.log(`Serial: ${SERIAL_PATH || '(not set)'} @ ${SERIAL_BAUD}`);
+  server.listen(PORT, '0.0.0.0', () => {
+    const hostHint = PORT === 80 || PORT === 443 ? '' : `:${PORT}`;
+    console.log(`Web UI: http://127.0.0.1${hostHint} (LAN: http://<this-machine-ip>${hostHint})`);
+    if (SERIAL_PATH) console.log(`Serial: ${normalizePortPath(SERIAL_PATH)} @ ${SERIAL_BAUD}`);
+    else if (DEVICE_TCP_HOST) console.log(`Device TCP: ${DEVICE_TCP_HOST}:${DEVICE_TCP_PORT} (JSON Lines, reconnect every 2s if down)`);
+    else console.log('Serial: (not set)');
   });
 }
 
@@ -307,4 +433,3 @@ main().catch((e) => {
   console.error(e);
   process.exit(1);
 });
-

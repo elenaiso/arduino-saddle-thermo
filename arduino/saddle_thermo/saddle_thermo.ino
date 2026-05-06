@@ -1,100 +1,151 @@
 /**
- * DS18B20 multi-sensor reader for horse-saddle thermal mat prototype.
+ * DS18B20 multi-sensor reader for horse-saddle thermal mat prototype (ESP32).
  *
- * - Auto-discovers sensor ROM addresses on startup (and can rescan on command)
- * - Applies per-sensor calibration (offset + scale)
- * - Streams readings over Serial as JSON Lines (one line per sample)
+ * Streams JSON Lines over USB Serial @ 115200:
+ *   {"type":"hello","proto":1,"fw":"esp32","sensors":[{"idx":0,"addr":"28..."}, ...]}
+ *   {"type":"sample","ms":12345,"mode":"walk","hz":2,"values":[{"idx":0,"ok":true,"rawC":23.1,"calC":23.1}, ...]}
  *
- * Wiring (typical):
- *  - DS18B20 DQ -> D2 (change ONE_WIRE_BUS if needed)
- *  - 4.7k pull-up from DQ to +5V
- *  - GND/GND, VDD/+5V (or parasitic power if you know what you're doing)
+ * Commands (single line, newline-terminated; also accepted from the web UI):
+ *   w  -> walk  (~2 Hz)
+ *   t  -> trot  (~5 Hz)
+ *   g  -> gallop (~10 Hz)
+ *   hz=<N> -> custom Hz (0.2..30)
+ *   r  -> rescan sensors
+ *
+ * Wiring:
+ *   - DS18B20 DQ -> ONE_WIRE_GPIO (default GPIO4)
+ *   - 4.7k pull-up from DQ to 3.3V
+ *   - VDD -> 3.3V, GND -> GND (common with ESP32)
+ *
+ * Remote (optional, same JSON Lines as USB Serial):
+ *   - Fill WIFI_SSID / WIFI_PASS: ESP32 joins Wi‑Fi and listens on TCP port SADDLE_REMOTE_TCP_PORT (default 3333).
+ *   - Point the Node bridge at the board: DEVICE_TCP_HOST=<IP> npm run dev  (or POST /api/connect-tcp)
+ *   - BT_DEVICE_NAME: BluetoothSerial (classic) SPP — pair phone/PC, open as a serial port; commands + JSON work like USB.
  */
- 
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <BluetoothSerial.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
 // ===== Hardware config =====
-static const uint8_t ONE_WIRE_BUS = 2;   // Arduino Nano D2
+#ifndef ONE_WIRE_GPIO
+#define ONE_WIRE_GPIO 4
+#endif
+
+#ifndef SADDLE_REMOTE_TCP_PORT
+#define SADDLE_REMOTE_TCP_PORT 3333
+#endif
+
 static const uint32_t SERIAL_BAUD = 115200;
 
-// ===== Sampling modes =====
-enum GaitMode : uint8_t {
-  MODE_WALK = 0,   // 1–2 Hz
-  MODE_TROT = 1,   // 4–5 Hz
-  MODE_GALLOP = 2  // 8–10 Hz
+// Empty WIFI_SSID => no Wi‑Fi (USB / BT only)
+static const char *WIFI_SSID = "";
+static const char *WIFI_PASS = "";
+// Empty => BluetoothSerial disabled (ESP32‑S3 has no classic BT)
+static const char *BT_DEVICE_NAME = "";
+
+static const size_t MAX_REMOTE_TCP_CLIENTS = 3;
+static WiFiServer wifiTcpServer(SADDLE_REMOTE_TCP_PORT);
+static WiFiClient wifiTcpClients[MAX_REMOTE_TCP_CLIENTS];
+BluetoothSerial SerialBT;
+static bool btStarted = false;
+static bool wifiListenStarted = false;
+
+struct CmdRx {
+  char buf[48];
+  uint8_t len;
+};
+static CmdRx rxSerial;
+static CmdRx rxBt;
+static CmdRx rxWifiTcp[MAX_REMOTE_TCP_CLIENTS];
+
+static void handleImmediateByte(char c);
+static void handleLine(const String &line);
+
+// ===== Protocol / sampling =====
+static const uint8_t MAX_SENSORS = 32;
+
+enum class Gait : uint8_t { Walk = 0, Trot = 1, Gallop = 2 };
+
+struct GaitCfg {
+  const char *name;
+  uint8_t hz;
 };
 
-struct ModeCfg {
-  uint8_t hz;               // target sample rate
-  uint16_t periodMs() const { return (uint16_t)(1000U / (uint16_t)hz); }
+static const GaitCfg GAITS[] = {
+  {"walk", 2},
+  {"trot", 5},
+  {"gallop", 10},
 };
 
-static ModeCfg MODE_CFGS[] = {
-  {2},   // walk: use 2 Hz as default within 1–2 Hz
-  {5},   // trot: 5 Hz within 4–5 Hz
-  {10}   // gallop: 10 Hz within 8–10 Hz
-};
-
-// ===== DS18B20 handling =====
-OneWire oneWire(ONE_WIRE_BUS);
+OneWire oneWire(ONE_WIRE_GPIO);
 DallasTemperature sensors(&oneWire);
 
-static const uint8_t MAX_SENSORS = 16; // target later: 8 left + 8 right
+DeviceAddress addrs[MAX_SENSORS];
+uint8_t sensorCount = 0;
 
-struct SensorSlot {
-  DeviceAddress addr;
-  bool present = false;
-  float offsetC = 0.0f;     // calibration: add after scaling
-  float scale = 1.0f;       // calibration: multiply raw value
-};
+Gait gait = Gait::Walk;
+uint8_t customHz = 0; // 0 => use gait default
 
-static SensorSlot slots[MAX_SENSORS];
-static uint8_t sensorCount = 0;
+bool conversionInFlight = false;
+uint32_t convStartMs = 0;
+uint32_t nextKickMs = 0;
 
-// Simple address->calibration mapping.
-// If you later want persistent calibration, store it in EEPROM and provide a command to set it.
+// Never interleave JSON lines: defer scans/hello emission until we're idle.
+volatile bool pendingRescan = false;
+
+// Optional calibration table (fill with your ROM addresses after discovery).
 struct CalibEntry {
   DeviceAddress addr;
   float offsetC;
   float scale;
 };
 
-// Example placeholder calibration table (empty by default).
-// You can fill this with known addresses after first discovery.
 static const CalibEntry CALIB_TABLE[] = {
   // {{0x28, 0xFF, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01}, 0.20f, 1.00f},
 };
 static const uint8_t CALIB_TABLE_LEN = sizeof(CALIB_TABLE) / sizeof(CALIB_TABLE[0]);
 
-static GaitMode gaitMode = MODE_WALK;
-static uint8_t customHz = 0; // 0 => use gait default
-static uint32_t nextSampleAtMs = 0;
-static uint32_t seqNo = 0;
-
-static char cmdBuf[24];
-static uint8_t cmdLen = 0;
-
-static bool conversionInFlight = false;
-static uint32_t conversionReadyAtMs = 0;
-static uint8_t dsResolutionBits = 10;
-static uint32_t lastAutoRescanAtMs = 0;
-
-static uint8_t currentHz() {
-  return customHz ? customHz : MODE_CFGS[(uint8_t)gaitMode].hz;
+static void copyAddr(DeviceAddress dst, const DeviceAddress src) {
+  for (uint8_t i = 0; i < 8; i++) dst[i] = src[i];
 }
 
-static uint8_t resolutionForHz(uint8_t hz) {
+static bool addrEq(const DeviceAddress a, const DeviceAddress b) {
+  for (uint8_t i = 0; i < 8; i++) if (a[i] != b[i]) return false;
+  return true;
+}
+
+static void applyCalibForAddr(const DeviceAddress addr, float rawC, float &outCalC) {
+  outCalC = rawC;
+  for (uint8_t i = 0; i < CALIB_TABLE_LEN; i++) {
+    if (addrEq(addr, CALIB_TABLE[i].addr)) {
+      outCalC = rawC * CALIB_TABLE[i].scale + CALIB_TABLE[i].offsetC;
+      return;
+    }
+  }
+}
+
+static uint8_t targetHz() {
+  if (customHz) return customHz;
+  return GAITS[(uint8_t)gait].hz;
+}
+
+static const char *modeName() {
+  return GAITS[(uint8_t)gait].name;
+}
+
+static uint8_t resolutionBitsForHz(uint8_t hz) {
   // DS18B20 typical conversion time:
-  // 12-bit: 750ms, 11-bit: 375ms, 10-bit: 188ms, 9-bit: 94ms
-  // Choose lower resolution for higher sample rates.
-  if (hz >= 9) return 9;   // enables ~10Hz+
-  if (hz >= 5) return 10;  // ~5Hz
+  // 12-bit: ~750ms, 11-bit: ~375ms, 10-bit: ~188ms, 9-bit: ~94ms
+  if (hz >= 9) return 9;
+  if (hz >= 5) return 10;
   return 11;
 }
 
-static uint16_t conversionMsForResolution(uint8_t resBits) {
-  switch (resBits) {
+static uint16_t conversionMsForBits(uint8_t bits) {
+  switch (bits) {
     case 9: return 95;
     case 10: return 190;
     case 11: return 380;
@@ -102,224 +153,271 @@ static uint16_t conversionMsForResolution(uint8_t resBits) {
   }
 }
 
-static void updateDsResolution() {
-  const uint8_t want = resolutionForHz(currentHz());
-  if (want == dsResolutionBits) return;
-  dsResolutionBits = want;
-  sensors.setResolution(dsResolutionBits);
-}
-
-static void printAddressHex(const DeviceAddress addr) {
-  for (uint8_t i = 0; i < 8; i++) {
-    if (addr[i] < 16) Serial.print('0');
-    Serial.print(addr[i], HEX);
-  }
-}
-
-static void copyAddress(DeviceAddress dst, const DeviceAddress src) {
-  for (uint8_t i = 0; i < 8; i++) dst[i] = src[i];
-}
-
-static bool addressEquals(const DeviceAddress a, const DeviceAddress b) {
-  for (uint8_t i = 0; i < 8; i++) if (a[i] != b[i]) return false;
-  return true;
-}
-
-static void applyCalibrationForSlot(SensorSlot &slot) {
-  slot.offsetC = 0.0f;
-  slot.scale = 1.0f;
-  for (uint8_t i = 0; i < CALIB_TABLE_LEN; i++) {
-    if (addressEquals(slot.addr, CALIB_TABLE[i].addr)) {
-      slot.offsetC = CALIB_TABLE[i].offsetC;
-      slot.scale = CALIB_TABLE[i].scale;
-      return;
+static void bridgePrintLine(const String &line) {
+  for (size_t i = 0; i < MAX_REMOTE_TCP_CLIENTS; i++) {
+    if (wifiTcpClients[i] && wifiTcpClients[i].connected()) {
+      wifiTcpClients[i].println(line);
     }
   }
-}
-
-static void clearSlots() {
-  sensorCount = 0;
-  for (uint8_t i = 0; i < MAX_SENSORS; i++) {
-    slots[i].present = false;
-    slots[i].offsetC = 0.0f;
-    slots[i].scale = 1.0f;
-  }
-}
-
-static uint8_t discoverSensors() {
-  clearSlots();
-
-  const uint8_t found = sensors.getDeviceCount();
-  uint8_t added = 0;
-  DeviceAddress addr;
-  for (uint8_t i = 0; i < found && added < MAX_SENSORS; i++) {
-    if (!sensors.getAddress(addr, i)) continue;
-    copyAddress(slots[added].addr, addr);
-    slots[added].present = true;
-    applyCalibrationForSlot(slots[added]);
-    added++;
-  }
-  sensorCount = added;
-  return added;
+  if (btStarted) SerialBT.println(line);
 }
 
 static void emitHello() {
-  Serial.print("{\"type\":\"hello\",\"fw\":\"saddle_thermo\",\"maxSensors\":");
-  Serial.print(MAX_SENSORS);
-  Serial.print(",\"oneWireBus\":");
-  Serial.print(ONE_WIRE_BUS);
-  Serial.print(",\"mode\":\"");
-  Serial.print((gaitMode == MODE_WALK) ? "walk" : (gaitMode == MODE_TROT) ? "trot" : "gallop");
-  Serial.print("\",\"hz\":");
-  Serial.print(customHz ? customHz : MODE_CFGS[(uint8_t)gaitMode].hz);
-  Serial.print(",\"sensors\":[");
+  String line;
+  line.reserve(sensorCount * 30 + 80);
+  line = "{\"type\":\"hello\",\"proto\":1,\"fw\":\"esp32\",\"sensors\":[";
   for (uint8_t i = 0; i < sensorCount; i++) {
-    if (i) Serial.print(',');
-    Serial.print("{\"idx\":");
-    Serial.print(i);
-    Serial.print(",\"addr\":\"");
-    printAddressHex(slots[i].addr);
-    Serial.print("\",\"offsetC\":");
-    Serial.print(slots[i].offsetC, 3);
-    Serial.print(",\"scale\":");
-    Serial.print(slots[i].scale, 6);
-    Serial.print('}');
-  }
-  Serial.println("]}");
-}
-
-static void setModeByChar(char c) {
-  if (c == 'w') gaitMode = MODE_WALK;
-  else if (c == 't') gaitMode = MODE_TROT;
-  else if (c == 'g') gaitMode = MODE_GALLOP;
-  customHz = 0; // switching gait resets custom hz
-  conversionInFlight = false;
-  nextSampleAtMs = 0; // reschedule immediately
-}
-
-static void setCustomHz(uint8_t hz) {
-  if (hz < 1) hz = 1;
-  if (hz > 25) hz = 25;
-  customHz = hz;
-  conversionInFlight = false;
-  nextSampleAtMs = 0;
-}
-
-static void handleCommandLine(const char *s) {
-  if (!s || !s[0]) return;
-  // support: hz=7
-  if ((s[0] == 'h' || s[0] == 'H') && (s[1] == 'z' || s[1] == 'Z') && s[2] == '=') {
-    int v = atoi(s + 3);
-    if (v > 0) {
-      setCustomHz((uint8_t)v);
-      emitHello();
+    if (i) line += ',';
+    line += "{\"idx\":";
+    line += (int)i;
+    line += ",\"addr\":\"";
+    for (uint8_t b = 0; b < 8; b++) {
+      if (addrs[i][b] < 16) line += '0';
+      line += String(addrs[i][b], HEX);
     }
-    return;
+    line += "\"}";
   }
+  line += "]}";
+  Serial.println(line);
+  bridgePrintLine(line);
 }
 
-static void handleSerialCommands() {
-  while (Serial.available() > 0) {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      cmdBuf[cmdLen] = 0;
-      handleCommandLine(cmdBuf);
-      cmdLen = 0;
+static void emitSampleLine(uint32_t nowMs, uint8_t hz) {
+  String line;
+  line.reserve(520);
+  line = "{\"type\":\"sample\",\"ms\":";
+  line += (uint32_t)nowMs;
+  line += ",\"mode\":\"";
+  line += modeName();
+  line += "\",\"hz\":";
+  line += (int)hz;
+  line += ",\"values\":[";
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    float rawC = sensors.getTempC(addrs[i]);
+    bool ok = !isnan(rawC) && rawC > -55.0f && rawC < 125.0f;
+    float calC = rawC;
+    if (ok) applyCalibForAddr(addrs[i], rawC, calC);
+    if (i) line += ',';
+    line += "{\"idx\":";
+    line += (int)i;
+    line += ",\"ok\":";
+    line += ok ? "true" : "false";
+    line += ",\"rawC\":";
+    if (ok) line += String(rawC, 3); else line += "null";
+    line += ",\"calC\":";
+    if (ok) line += String(calC, 3); else line += "null";
+    line += "}";
+  }
+  line += "]}";
+  Serial.println(line);
+  bridgePrintLine(line);
+}
+
+static void drainCmdRx(Stream &in, CmdRx &rx) {
+  while (in.available()) {
+    char ch = (char)in.read();
+    if (ch == '\r') continue;
+
+    if (ch == '\n') {
+      rx.buf[rx.len] = 0;
+      rx.len = 0;
+      handleLine(String(rx.buf));
       continue;
     }
 
-    if (c == 'r') { // rescan
-      discoverSensors();
-      emitHello();
-    } else if (c == 'w' || c == 't' || c == 'g') {
-      setModeByChar(c);
-      emitHello();
-    } else {
-      // accumulate into line buffer for multi-char commands
-      if (cmdLen < sizeof(cmdBuf) - 1) {
-        cmdBuf[cmdLen++] = c;
+    if (rx.len == 0 && (ch == 'w' || ch == 't' || ch == 'g' || ch == 'r')) {
+      handleImmediateByte(ch);
+      continue;
+    }
+
+    if (rx.len < sizeof(rx.buf) - 1) rx.buf[rx.len++] = ch;
+    else rx.len = 0;
+  }
+}
+
+static void serviceWifiLink() {
+  if (!WIFI_SSID || !WIFI_SSID[0]) return;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiListenStarted) {
+      wifiListenStarted = false;
+      for (size_t i = 0; i < MAX_REMOTE_TCP_CLIENTS; i++) {
+        if (wifiTcpClients[i]) wifiTcpClients[i].stop();
       }
+      wifiTcpServer.end();
+    }
+    static uint32_t lastTry = 0;
+    if (millis() - lastTry > 8000) {
+      lastTry = millis();
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    return;
+  }
+
+  if (!wifiListenStarted) {
+    wifiListenStarted = true;
+    wifiTcpServer.begin();
+    Serial.print(F("WiFi TCP JSON bridge "));
+    Serial.print(WiFi.localIP());
+    Serial.print(F(":"));
+    Serial.println((unsigned)SADDLE_REMOTE_TCP_PORT);
+  }
+
+  WiFiClient inc = wifiTcpServer.available();
+  if (inc) {
+    for (size_t i = 0; i < MAX_REMOTE_TCP_CLIENTS; i++) {
+      if (!wifiTcpClients[i] || !wifiTcpClients[i].connected()) {
+        if (wifiTcpClients[i]) wifiTcpClients[i].stop();
+        wifiTcpClients[i] = inc;
+        break;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < MAX_REMOTE_TCP_CLIENTS; i++) {
+    if (wifiTcpClients[i] && wifiTcpClients[i].connected()) {
+      drainCmdRx(wifiTcpClients[i], rxWifiTcp[i]);
+    } else if (wifiTcpClients[i]) {
+      wifiTcpClients[i].stop();
     }
   }
 }
 
-static void sampleOnce() {
-  // Read values after a completed conversion (conversion is requested in loop()).
-
-  Serial.print("{\"type\":\"sample\",\"seq\":");
-  Serial.print(seqNo++);
-  Serial.print(",\"ms\":");
-  Serial.print(millis());
-  Serial.print(",\"mode\":\"");
-  Serial.print((gaitMode == MODE_WALK) ? "walk" : (gaitMode == MODE_TROT) ? "trot" : "gallop");
-  Serial.print("\",\"hz\":");
-  Serial.print(currentHz());
-  Serial.print(",\"values\":[");
-
-  uint8_t disconnected = 0;
+static void scanSensors() {
+  sensors.begin();
+  uint8_t n = sensors.getDeviceCount();
+  if (n > MAX_SENSORS) n = MAX_SENSORS;
+  sensorCount = n;
   for (uint8_t i = 0; i < sensorCount; i++) {
-    if (i) Serial.print(',');
-    float raw = sensors.getTempC(slots[i].addr);
-    // DallasTemperature returns DEVICE_DISCONNECTED_C (-127) when missing
-    bool ok = (raw > -100.0f && raw < 150.0f);
-    if (!ok) disconnected++;
-    float cal = ok ? (raw * slots[i].scale + slots[i].offsetC) : raw;
-
-    Serial.print("{\"idx\":");
-    Serial.print(i);
-    Serial.print(",\"addr\":\"");
-    printAddressHex(slots[i].addr);
-    Serial.print("\",\"rawC\":");
-    Serial.print(raw, 3);
-    Serial.print(",\"calC\":");
-    Serial.print(cal, 3);
-    Serial.print(",\"ok\":");
-    Serial.print(ok ? "true" : "false");
-    Serial.print('}');
+    sensors.getAddress(addrs[i], i);
   }
+  conversionInFlight = false;
+  nextKickMs = millis() + 50;
+}
 
-  Serial.println("]}");
+static void scheduleRescan() { pendingRescan = true; }
 
-  // If sensors were unplugged/replugged, refresh the address list automatically.
-  const uint32_t now = millis();
-  if (disconnected > 0 && (now - lastAutoRescanAtMs) > 2000) {
-    lastAutoRescanAtMs = now;
-    discoverSensors();
-    emitHello();
+static void maybeEmitDeferred() {
+  if (conversionInFlight) return;
+  if (!pendingRescan) return;
+
+  pendingRescan = false;
+
+  scanSensors();
+  emitHello();
+}
+
+static void handleImmediateByte(char c) {
+  // Single-char commands are intentionally handled without requiring '\n'.
+  // This prevents "r" typed in serial monitors from being injected mid-JSON output.
+  switch (c) {
+    case 'w':
+      customHz = 0;
+      gait = Gait::Walk;
+      break;
+    case 't':
+      customHz = 0;
+      gait = Gait::Trot;
+      break;
+    case 'g':
+      customHz = 0;
+      gait = Gait::Gallop;
+      break;
+    case 'r':
+      scheduleRescan();
+      break;
+    default:
+      break;
+  }
+}
+
+static void handleLine(const String &line) {
+  if (line.length() == 0) return;
+  if (line == "w") {
+    handleImmediateByte('w');
+    return;
+  }
+  if (line == "t") {
+    handleImmediateByte('t');
+    return;
+  }
+  if (line == "g") {
+    handleImmediateByte('g');
+    return;
+  }
+  if (line == "r") {
+    handleImmediateByte('r');
+    return;
+  }
+  if (line.startsWith("hz=")) {
+    float v = line.substring(3).toFloat();
+    if (v >= 0.2f && v <= 30.0f) customHz = (uint8_t)(v + 0.5f);
   }
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  // Small delay to allow serial monitor to attach on some hosts
-  delay(300);
+  delay(150);
 
-  sensors.begin();
-  sensors.setResolution(dsResolutionBits);
-  sensors.setWaitForConversion(false); // async conversions
+  if (WIFI_SSID && WIFI_SSID[0]) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+  if (BT_DEVICE_NAME && BT_DEVICE_NAME[0]) {
+    SerialBT.begin(BT_DEVICE_NAME);
+    btStarted = true;
+  }
 
-  discoverSensors();
+  sensors.setWaitForConversion(false);
+  scanSensors();
   emitHello();
 }
 
 void loop() {
-  handleSerialCommands();
+  serviceWifiLink();
+  drainCmdRx(Serial, rxSerial);
+  if (btStarted) drainCmdRx(SerialBT, rxBt);
 
   const uint32_t now = millis();
+  const uint8_t hz = targetHz();
+  const uint32_t periodMs = (uint32_t)(1000UL / (uint32_t)hz);
 
-  updateDsResolution();
-  const uint16_t convMs = conversionMsForResolution(dsResolutionBits);
+  if (sensorCount == 0) {
+    if (now - nextKickMs > 1500) {
+      nextKickMs = now;
+      scheduleRescan();
+    }
+    maybeEmitDeferred();
+    delay(2);
+    return;
+  }
+
+  const uint8_t bits = resolutionBitsForHz(hz);
+  sensors.setResolution(bits);
 
   if (!conversionInFlight) {
-    sensors.requestTemperatures();
-    conversionInFlight = true;
-    conversionReadyAtMs = now + convMs;
+    if (now >= nextKickMs) {
+      nextKickMs = now + periodMs;
+      sensors.requestTemperatures();
+      conversionInFlight = true;
+      convStartMs = now;
+    }
+    maybeEmitDeferred();
+    delay(1);
+    return;
   }
 
-  if (conversionInFlight && (int32_t)(now - conversionReadyAtMs) >= 0) {
-    sampleOnce();
-    conversionInFlight = false; // next loop will request next conversion
+  const uint16_t need = conversionMsForBits(bits);
+  if ((uint32_t)(now - convStartMs) < need) {
+    maybeEmitDeferred();
+    delay(1);
+    return;
   }
+
+  conversionInFlight = false;
+
+  emitSampleLine(now, hz);
+
+  maybeEmitDeferred();
 }
-

@@ -16,8 +16,11 @@
         <div class="controls">
           <a class="btn btn-secondary" href="/">Теплокарта</a>
           <a class="btn btn-secondary" href="/graph.html">График</a>
+          <button class="btn btn-secondary" id="modeSensorsBtn">Датчики</button>
+          <button class="btn btn-secondary" id="modeContourBtn">Контур</button>
           <button class="btn" id="saveBtn">Сохранить</button>
           <button class="btn btn-secondary" id="resetBtn">Сброс</button>
+          <button class="btn btn-secondary" id="resetContourBtn">Сброс контура</button>
           <button class="btn btn-secondary" id="exportBtn">Экспорт JSON</button>
           <label class="btn btn-secondary" style="display:inline-flex;gap:10px;align-items:center;">
             Импорт
@@ -29,15 +32,59 @@
       <main class="main">
         <section class="card heatmap-card">
           <div class="card-title">
-            Ручная расстановка датчиков (перетащите точки)
-            <span class="pill mono" id="hintPill">drag & drop</span>
+            Расстановка датчиков
+            <span class="pill mono" id="hintPill">таблица + canvas</span>
           </div>
           <div class="sub">
-            Перетаскивайте датчик на слот слева/справа — он “прилипнет” к ближайшему фиксированному месту. Сохранение идёт в браузер (localStorage).
+            Основной способ: таблица ниже — выберите слот (позицию) для каждого датчика. На canvas можно по-прежнему тянуть маркеры в режиме “Датчики” или править контур в режиме “Контур”.
           </div>
           <div style="height:10px"></div>
           <canvas id="editor" width="1600" height="900"></canvas>
           <div class="sub mono" style="margin-top:10px" id="stats">—</div>
+          <div style="height:14px"></div>
+          <div class="card-title" style="margin-bottom:10px">
+            Справочник слотов (геометрия из <span class="mono">layout.json</span>)
+          </div>
+          <div class="sub" style="margin:-6px 0 10px 0">
+            Базовые координаты каждого слота в системе макета (как на схеме седла). Колонка «Доля по длине» — грубо от <span class="mono">physical.ref.yTopPx</span> к <span class="mono">yBottomPx</span> (верх седла → низ). Базовая температура для <strong>интерполяции теплокарты</strong> (не «норма» слота): <span class="mono" id="layoutBaselineC">—</span> °C.
+          </div>
+          <div class="table-wrap">
+            <table class="data-table mono" id="slotsRefTable">
+              <thead>
+                <tr>
+                  <th>Сторона</th>
+                  <th>Id слота</th>
+                  <th>Позиция</th>
+                  <th>X</th>
+                  <th>Y</th>
+                  <th>Доля по длине</th>
+                </tr>
+              </thead>
+              <tbody id="slotsRefBody"></tbody>
+            </table>
+          </div>
+          <div style="height:18px"></div>
+          <div class="card-title" style="margin-bottom:10px">
+            Датчики (таблица)
+            <span class="pill mono" id="sensorTablePill">—</span>
+          </div>
+          <div class="sub" style="margin:-6px 0 10px 0">
+            Температура — из последнего <span class="mono">sample</span>. Колонка “Слот” задаёт физическую позицию на контуре (лево/право подставится автоматически).
+          </div>
+          <div class="table-wrap">
+            <table class="data-table mono" id="sensorTable">
+              <thead>
+                <tr>
+                  <th>Датчик</th>
+                  <th>Адрес</th>
+                  <th>Температура</th>
+                  <th>Слот</th>
+                  <th>Сторона</th>
+                </tr>
+              </thead>
+              <tbody id="sensorTableBody"></tbody>
+            </table>
+          </div>
         </section>
       </main>
     </div>

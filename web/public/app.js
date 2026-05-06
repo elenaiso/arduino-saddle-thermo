@@ -37,8 +37,10 @@ const state = {
   isLegacy: false,
   baselineByIdx: new Map(),
   fixedRange: { auto: true, min: null, max: null },
-  assignments: {} // sensorIdx -> slotId
+  assignments: {}, // sensorIdx -> slotId
+  contourOverrides: null // { left: [[x,y]...], right: [[x,y]...] }
 };
+state._serialConnectEpoch = 0;
 
 function loadUiRateFromStorage(){
   try {
@@ -76,12 +78,24 @@ state.heatmapHz = loadHeatmapRateFromStorage();
 state.lastHeatmapAtMs = 0;
 state.portPoll = { timer: null, inFlight: false, lastConnectAttemptMs: 0 };
 
+function normalizeAssignmentsObject(obj){
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    const sensorIdx = Number(k);
+    const slotId = Number(v);
+    if (!Number.isFinite(sensorIdx)) continue;
+    if (!Number.isFinite(slotId)) continue;
+    out[String(sensorIdx)] = slotId;
+  }
+  return out;
+}
+
 function loadAssignmentsFromStorage(){
   try {
     const raw = localStorage.getItem('saddleThermoAssignments');
-    const next = raw ? JSON.parse(raw) : {};
+    const next = normalizeAssignmentsObject(raw ? JSON.parse(raw) : {});
     const prevStr = state._assignmentsStr || '';
-    const nextStr = raw || '';
+    const nextStr = JSON.stringify(next);
     state.assignments = next;
     state._assignmentsStr = nextStr;
 
@@ -97,6 +111,36 @@ function loadAssignmentsFromStorage(){
   }
 }
 
+function loadContourOverridesFromStorage(){
+  try {
+    const raw = localStorage.getItem('saddleThermoContour');
+    const parsed = raw ? JSON.parse(raw) : null;
+    const next = (parsed && typeof parsed === 'object') ? parsed : null;
+    const prevStr = state._contourStr || '';
+    const nextStr = raw || '';
+    state.contourOverrides = next;
+    state._contourStr = nextStr;
+
+    // If contour changed, force a re-render using last sample
+    if (prevStr !== nextStr && state.sample) {
+      state.hasNewFrame = true;
+    }
+  } catch {}
+}
+
+function loadSlotOverridesFromStorage(){
+  try {
+    const raw = localStorage.getItem('saddleThermoSlots');
+    const parsed = raw ? JSON.parse(raw) : null;
+    const next = (parsed && typeof parsed === 'object') ? parsed : null;
+    const prevStr = state._slotsStr || '';
+    const nextStr = raw || '';
+    state.slotOverrides = next;
+    state._slotsStr = nextStr;
+    if (prevStr !== nextStr && state.sample) state.hasNewFrame = true;
+  } catch {}
+}
+
 function saveAssignmentsToStorage(){
   try {
     localStorage.setItem('saddleThermoAssignments', JSON.stringify(state.assignments || {}));
@@ -110,14 +154,126 @@ function resetAssignments(){
 
 function assignedSlotForSensor(sensorIdx){
   const v = state.assignments?.[String(sensorIdx)];
-  return (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 function sensorIdxForSlot(slotId){
+  const want = Number(slotId);
+  if (!Number.isFinite(want)) return null;
   for (const [k, v] of Object.entries(state.assignments || {})) {
-    if (v === slotId) return Number(k);
+    if (Number(v) === want) return Number(k);
   }
   return null;
+}
+
+function allLayoutSlotIds(){
+  const ids = [];
+  for (const s of (layout?.left?.sensors || [])) ids.push(s.idx);
+  for (const s of (layout?.right?.sensors || [])) ids.push(s.idx);
+  return ids;
+}
+
+function pruneAssignmentsToHelloSensors(){
+  const sensorIdxs = new Set((state.hello?.sensors || []).map(s => s.idx));
+  for (const k of Object.keys(state.assignments || {})) {
+    const idx = Number(k);
+    if (!sensorIdxs.has(idx)) delete state.assignments[k];
+  }
+}
+
+function pruneAssignmentsToLayoutSlots(){
+  if (!layout) return;
+  const slots = new Set(allLayoutSlotIds());
+  for (const [k, slotId] of Object.entries(state.assignments || {})) {
+    const sid = Number(slotId);
+    if (!Number.isFinite(sid) || !slots.has(sid)) delete state.assignments[k];
+  }
+}
+
+function ensureDefaultAssignmentsFromHello(){
+  if (!layout) return;
+  if (state.assignments && Object.keys(state.assignments).length > 0) return;
+
+  const slots = new Set(allLayoutSlotIds());
+  const sensorIdxs = (state.hello?.sensors || []).map(s => s.idx);
+  if (!sensorIdxs.length) return;
+
+  const used = new Set();
+  for (const idx of sensorIdxs) {
+    if (slots.has(idx) && !used.has(idx)) {
+      state.assignments[String(idx)] = idx;
+      used.add(idx);
+    }
+  }
+
+  const free = Array.from(slots).filter(id => !used.has(id)).sort((a,b) => a-b);
+  for (const idx of sensorIdxs) {
+    if (state.assignments[String(idx)] != null) continue;
+    const slotId = free.shift();
+    if (slotId == null) break;
+    state.assignments[String(idx)] = slotId;
+  }
+}
+
+function reconcileAssignmentsWithHello(){
+  if (!state.hello) return;
+  pruneAssignmentsToHelloSensors();
+  pruneAssignmentsToLayoutSlots();
+  ensureDefaultAssignmentsFromHello();
+  saveAssignmentsToStorage();
+  if (state.sample) state.hasNewFrame = true;
+}
+
+function helloSensorSet(hello){
+  const out = new Set();
+  for (const s of (hello?.sensors || [])) out.add(s.idx);
+  return out;
+}
+
+function ensureHelloFromSample(sample){
+  // The heatmap editor relies on `hello` + assignments. The graph page can work with `sample` alone.
+  // If firmware/UI missed `hello`, derive a minimal one from the sample indices.
+  if (!sample || !Array.isArray(sample.values)) return;
+
+  const idxs = [];
+  for (const v of sample.values) {
+    if (v && typeof v.idx === 'number' && Number.isFinite(v.idx)) idxs.push(v.idx);
+  }
+  if (!idxs.length) return;
+
+  const uniq = Array.from(new Set(idxs)).sort((a,b)=>a-b);
+  const prev = helloSensorSet(state.hello);
+  const next = new Set(uniq);
+  let same = prev.size === next.size;
+  if (same) {
+    for (const x of next) {
+      if (!prev.has(x)) { same = false; break; }
+    }
+  }
+
+  if (state.hello && same) return;
+
+  // Merge addrs if we already had a hello (keep known ROMs), otherwise use placeholders.
+  const addrByIdx = new Map();
+  for (const s of (state.hello?.sensors || [])) addrByIdx.set(s.idx, s.addr);
+
+  const sensors = uniq.map((idx) => ({
+    idx,
+    addr: addrByIdx.get(idx) || '—',
+  }));
+
+  state.hello = { type: 'hello', proto: 1, fw: 'derived-from-sample', sensors };
+  state.isLegacy = false;
+  reconcileAssignmentsWithHello();
+}
+
+function requestDeviceRescan(){
+  try {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send('r');
+  } catch {}
 }
 
 function loadFixedRangeFromStorage(){
@@ -488,18 +644,28 @@ function drawHeatmap(values){
     return sensors.map(s => ({ ...s, xy: [s.xy[0] + dx, s.xy[1]] }));
   }
 
+function slotXYWithOverrides(side, slot){
+  const o = state.slotOverrides?.[side]?.[String(slot.idx)];
+  if (Array.isArray(o) && o.length === 2 && Number.isFinite(o[0]) && Number.isFinite(o[1])) return [o[0], o[1]];
+  return slot.xy;
+}
+
   function centerDx(points){
     const b = bboxOf(points);
     const cx = (b.x0 + b.x1) / 2;
     return (srcW / 2) - cx;
   }
 
-  const leftContour = layout.left.contour;
-  const rightContour = layout.right.contour;
+  const leftContour = (Array.isArray(state.contourOverrides?.left) && state.contourOverrides.left.length >= 4)
+    ? state.contourOverrides.left
+    : layout.left.contour;
+  const rightContour = (Array.isArray(state.contourOverrides?.right) && state.contourOverrides.right.length >= 4)
+    ? state.contourOverrides.right
+    : layout.right.contour;
 
   // Treat layout.*.sensors as SLOT definitions (fixed positions).
-  const leftSlots = layout.left.sensors;
-  const rightSlots = layout.right.sensors;
+  const leftSlots = layout.left.sensors.map(s => ({ ...s, xy: slotXYWithOverrides('left', s) }));
+  const rightSlots = layout.right.sensors.map(s => ({ ...s, xy: slotXYWithOverrides('right', s) }));
 
   // Build render/interp sensor points from assignments (sensorIdx -> slotId).
   // IMPORTANT: do not fall back to identity mapping, otherwise "ghost" sensors appear.
@@ -580,17 +746,30 @@ function onMessage(msg){
     const p = msg.path ? `${msg.path}` : '—';
     const b = msg.baud ? `${msg.baud}` : '—';
     subline.textContent = `Serial: ${msg.status} • ${p} • ${b}`;
-    if (msg.status === 'connected') stopPortPolling();
+    if (msg.status === 'connected') {
+      stopPortPolling();
+      // Firmware may miss delivering `hello` if the browser connects slightly later;
+      // asking for a rescan is cheap and produces a fresh `hello`.
+      state._serialConnectEpoch++;
+      const epoch = state._serialConnectEpoch;
+      setTimeout(() => {
+        if (state.serial?.status === 'connected' && epoch === state._serialConnectEpoch) {
+          requestDeviceRescan();
+        }
+      }, 250);
+    }
     if (msg.status === 'closed' || msg.status === 'error' || msg.status === 'disconnected') startPortPolling();
     return;
   }
   if (msg.type === 'hello') {
     state.hello = msg;
     state.isLegacy = String(msg?.fw || '').includes('legacy');
+    reconcileAssignmentsWithHello();
     return;
   }
   if (msg.type === 'sample') {
     state.sample = msg;
+    ensureHelloFromSample(msg);
     const nowMs = Date.now();
     if (state.lastSampleAtMs) {
       const dt = nowMs - state.lastSampleAtMs;
@@ -809,15 +988,22 @@ async function loadLayout(){
 // initial paint
 loadFixedRangeFromStorage();
 loadAssignmentsFromStorage();
+loadContourOverridesFromStorage();
+loadSlotOverridesFromStorage();
 syncRangeControls();
 setLegend(null, null);
 ensureSensorCards(DEFAULT_TOTAL);
 drawHeatmap([]);
 loadPorts();
 await loadLayout();
+if (state.hello) reconcileAssignmentsWithHello();
 connectWs();
 startPortPolling();
-setInterval(loadAssignmentsFromStorage, 1500);
+setInterval(() => {
+  loadAssignmentsFromStorage();
+  loadContourOverridesFromStorage();
+  loadSlotOverridesFromStorage();
+}, 1500);
 
 saveLayoutBtn?.addEventListener('click', () => {
   saveAssignmentsToStorage();
