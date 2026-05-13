@@ -29,6 +29,7 @@ body{
   border-radius:10px;
   min-width: 260px;
 }
+.wifi-input{min-width:200px}
 
 .btn{
   background: linear-gradient(180deg, #1b2b44 0%, #162238 100%);

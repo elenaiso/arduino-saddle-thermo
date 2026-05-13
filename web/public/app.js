@@ -3,6 +3,8 @@ const modePill = document.getElementById('modePill');
 const stats = document.getElementById('stats');
 const portSelect = document.getElementById('portSelect');
 const connectBtn = document.getElementById('connectBtn');
+const wifiHostInput = document.getElementById('wifiHostInput');
+const wifiConnectBtn = document.getElementById('wifiConnectBtn');
 const dimsLine = document.getElementById('dimsLine');
 const saveLayoutBtn = document.getElementById('saveLayoutBtn');
 const resetLayoutBtn = document.getElementById('resetLayoutBtn');
@@ -912,6 +914,52 @@ function connectWs(){
       connectBtn.textContent = 'Подключить';
     }
   });
+
+  wifiConnectBtn?.addEventListener('click', async () => {
+    const raw = String(wifiHostInput?.value || '').trim() || '192.168.4.1:3333';
+    const parsed = parseHostPort(raw);
+    if (!parsed) {
+      alert('Неверный адрес. Пример: 192.168.4.1:3333 или 192.168.4.1');
+      return;
+    }
+    try { localStorage.setItem('saddleThermoLastWifi', `${parsed.host}:${parsed.port}`); } catch {}
+    try {
+      wifiConnectBtn.disabled = true;
+      wifiConnectBtn.textContent = 'Подключаю…';
+      const r = await fetch('/api/connect-tcp', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ host: parsed.host, port: parsed.port })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j?.ok === false) {
+        alert(`Wi‑Fi подключение не удалось: ${j?.error || r.statusText || 'unknown'}`);
+      }
+    } finally {
+      wifiConnectBtn.disabled = false;
+      wifiConnectBtn.textContent = 'Wi‑Fi';
+    }
+  });
+
+  wifiHostInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      wifiConnectBtn?.click();
+    }
+  });
+}
+
+function parseHostPort(raw){
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  // Accept "host", "host:port", "tcp://host:port"
+  const stripped = s.replace(/^tcp:\/\//i, '');
+  const m = /^([^:\s]+)(?::(\d+))?$/.exec(stripped);
+  if (!m) return null;
+  const host = m[1];
+  const port = m[2] ? Number(m[2]) : 3333;
+  if (!host || !Number.isFinite(port) || port <= 0 || port > 65535) return null;
+  return { host, port };
 }
 
 async function loadPorts(){
@@ -990,12 +1038,17 @@ loadFixedRangeFromStorage();
 loadAssignmentsFromStorage();
 loadContourOverridesFromStorage();
 loadSlotOverridesFromStorage();
+try {
+  const lastWifi = localStorage.getItem('saddleThermoLastWifi');
+  if (wifiHostInput && lastWifi) wifiHostInput.value = lastWifi;
+} catch {}
 syncRangeControls();
 setLegend(null, null);
 ensureSensorCards(DEFAULT_TOTAL);
 drawHeatmap([]);
 loadPorts();
 await loadLayout();
+drawHeatmap([]); // re-render now that layout is loaded so we don't stay stuck on "Loading layout…"
 if (state.hello) reconcileAssignmentsWithHello();
 connectWs();
 startPortPolling();

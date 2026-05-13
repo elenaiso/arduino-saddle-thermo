@@ -42,6 +42,8 @@
           </select>
           <select class="select mono" id="portSelect" title="Serial port"></select>
           <button class="btn btn-secondary" id="connectBtn">Подключить</button>
+          <input class="select mono wifi-input" id="wifiHostInput" type="text" inputmode="decimal" placeholder="Wi‑Fi: 192.168.4.1:3333" title="IP[:порт] ESP32 (по умолчанию 192.168.4.1:3333 в AP режиме)" />
+          <button class="btn btn-secondary" id="wifiConnectBtn" title="Подключиться к плате по Wi‑Fi (TCP)">Wi‑Fi</button>
           <button class="btn" data-cmd="w">Шаг (w)</button>
           <button class="btn" data-cmd="t">Рысь (t)</button>
           <button class="btn" data-cmd="g">Галоп (g)</button>
@@ -93,7 +95,7 @@
       </main>
 
       <footer class="footer">
-        <div>Подключение: Arduino Nano → USB → Serial → WebSocket → браузер.</div>
+        <div>Подключение: ESP32 → USB Serial либо Wi‑Fi (TCP 3333) → WebSocket → браузер.</div>
         <div class="mono">Окно: <span id="stats">—</span></div>
       </footer>
     </div>

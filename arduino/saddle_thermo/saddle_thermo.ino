@@ -18,9 +18,13 @@
  *   - VDD -> 3.3V, GND -> GND (common with ESP32)
  *
  * Remote (optional, same JSON Lines as USB Serial):
- *   - Fill WIFI_SSID / WIFI_PASS: ESP32 joins Wi‑Fi and listens on TCP port SADDLE_REMOTE_TCP_PORT (default 3333).
- *   - Point the Node bridge at the board: DEVICE_TCP_HOST=<IP> npm run dev  (or POST /api/connect-tcp)
- *   - BT_DEVICE_NAME: BluetoothSerial (classic) SPP — pair phone/PC, open as a serial port; commands + JSON work like USB.
+ *   - AP mode (default): ESP32 hosts its own open Wi‑Fi `WIFI_SSID` (no password).
+ *       Connect your phone/laptop to it; bridge target is tcp://192.168.4.1:SADDLE_REMOTE_TCP_PORT.
+ *   - STA mode: set WIFI_AP_MODE=false and fill WIFI_SSID/WIFI_PASS with your home Wi‑Fi.
+ *       Point the Node bridge at the IP printed on USB Serial (DEVICE_TCP_HOST=<IP> npm run dev,
+ *       or POST /api/connect-tcp from the web UI).
+ *   - BT_DEVICE_NAME: BluetoothSerial (classic) SPP — pair phone/PC, open as a serial port;
+ *       commands + JSON work like USB. Empty on S3/C3 (no classic BT).
  */
 
 #include <Arduino.h>
@@ -40,17 +44,22 @@
 
 static const uint32_t SERIAL_BAUD = 115200;
 
-// Empty WIFI_SSID => no Wi‑Fi (USB / BT only)
-static const char *WIFI_SSID = "";
-static const char *WIFI_PASS = "";
-// Empty => BluetoothSerial disabled (ESP32‑S3 has no classic BT)
+// ===== Wi‑Fi =====
+// AP mode (default): board broadcasts an OPEN Wi‑Fi `WIFI_SSID` (no password).
+//   Connect your phone/laptop to it, then point the bridge at tcp://192.168.4.1:SADDLE_REMOTE_TCP_PORT.
+// STA mode: set WIFI_AP_MODE = false and fill WIFI_SSID / WIFI_PASS.
+// Empty WIFI_SSID => Wi‑Fi disabled (USB / BT only).
+static const bool WIFI_AP_MODE = true;
+static const char *WIFI_SSID = "SaddleThermo";
+static const char *WIFI_PASS = ""; // ignored in AP mode (open network)
+// Empty => BluetoothSerial disabled (ESP32‑S3/C3 have no classic BT)
 static const char *BT_DEVICE_NAME = "";
 
 static const size_t MAX_REMOTE_TCP_CLIENTS = 3;
 static WiFiServer wifiTcpServer(SADDLE_REMOTE_TCP_PORT);
 static WiFiClient wifiTcpClients[MAX_REMOTE_TCP_CLIENTS];
 BluetoothSerial SerialBT;
-static bool btStarted = false;
+static bool btSppActive = false;
 static bool wifiListenStarted = false;
 
 struct CmdRx {
@@ -159,7 +168,7 @@ static void bridgePrintLine(const String &line) {
       wifiTcpClients[i].println(line);
     }
   }
-  if (btStarted) SerialBT.println(line);
+  if (btSppActive) SerialBT.println(line);
 }
 
 static void emitHello() {
@@ -238,30 +247,55 @@ static void drainCmdRx(Stream &in, CmdRx &rx) {
 static void serviceWifiLink() {
   if (!WIFI_SSID || !WIFI_SSID[0]) return;
 
-  if (WiFi.status() != WL_CONNECTED) {
-    if (wifiListenStarted) {
-      wifiListenStarted = false;
-      for (size_t i = 0; i < MAX_REMOTE_TCP_CLIENTS; i++) {
-        if (wifiTcpClients[i]) wifiTcpClients[i].stop();
+  if (WIFI_AP_MODE) {
+    if (!wifiListenStarted) {
+      WiFi.mode(WIFI_AP);
+      // NULL password => open network.
+      bool ok = WiFi.softAP(WIFI_SSID,
+                            (WIFI_PASS && WIFI_PASS[0]) ? WIFI_PASS : (const char *)NULL);
+      if (!ok) {
+        static uint32_t lastFail = 0;
+        if (millis() - lastFail > 5000) {
+          lastFail = millis();
+          Serial.println(F("WiFi softAP() failed; retrying"));
+        }
+        return;
       }
-      wifiTcpServer.end();
+      wifiListenStarted = true;
+      wifiTcpServer.begin();
+      Serial.print(F("WiFi AP \""));
+      Serial.print(WIFI_SSID);
+      Serial.print(F("\" (open) TCP JSON bridge "));
+      Serial.print(WiFi.softAPIP());
+      Serial.print(F(":"));
+      Serial.println((unsigned)SADDLE_REMOTE_TCP_PORT);
     }
-    static uint32_t lastTry = 0;
-    if (millis() - lastTry > 8000) {
-      lastTry = millis();
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
+  } else {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiListenStarted) {
+        wifiListenStarted = false;
+        for (size_t i = 0; i < MAX_REMOTE_TCP_CLIENTS; i++) {
+          if (wifiTcpClients[i]) wifiTcpClients[i].stop();
+        }
+        wifiTcpServer.end();
+      }
+      static uint32_t lastTry = 0;
+      if (millis() - lastTry > 8000) {
+        lastTry = millis();
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+      }
+      return;
     }
-    return;
-  }
 
-  if (!wifiListenStarted) {
-    wifiListenStarted = true;
-    wifiTcpServer.begin();
-    Serial.print(F("WiFi TCP JSON bridge "));
-    Serial.print(WiFi.localIP());
-    Serial.print(F(":"));
-    Serial.println((unsigned)SADDLE_REMOTE_TCP_PORT);
+    if (!wifiListenStarted) {
+      wifiListenStarted = true;
+      wifiTcpServer.begin();
+      Serial.print(F("WiFi TCP JSON bridge "));
+      Serial.print(WiFi.localIP());
+      Serial.print(F(":"));
+      Serial.println((unsigned)SADDLE_REMOTE_TCP_PORT);
+    }
   }
 
   WiFiClient inc = wifiTcpServer.available();
@@ -361,12 +395,16 @@ void setup() {
   delay(150);
 
   if (WIFI_SSID && WIFI_SSID[0]) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    if (WIFI_AP_MODE) {
+      WiFi.mode(WIFI_AP);
+    } else {
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
   }
   if (BT_DEVICE_NAME && BT_DEVICE_NAME[0]) {
     SerialBT.begin(BT_DEVICE_NAME);
-    btStarted = true;
+    btSppActive = true;
   }
 
   sensors.setWaitForConversion(false);
@@ -377,15 +415,18 @@ void setup() {
 void loop() {
   serviceWifiLink();
   drainCmdRx(Serial, rxSerial);
-  if (btStarted) drainCmdRx(SerialBT, rxBt);
+  if (btSppActive) drainCmdRx(SerialBT, rxBt);
 
   const uint32_t now = millis();
   const uint8_t hz = targetHz();
   const uint32_t periodMs = (uint32_t)(1000UL / (uint32_t)hz);
 
   if (sensorCount == 0) {
-    if (now - nextKickMs > 1500) {
-      nextKickMs = now;
+    // Signed subtraction guards against millis() wraparound and the initial
+    // case where nextKickMs > now (which would otherwise underflow to MAX_UINT32
+    // and trigger a rescan flood every loop iteration).
+    if ((int32_t)(now - nextKickMs) > 1500) {
+      nextKickMs = now + 1500;
       scheduleRescan();
     }
     maybeEmitDeferred();
